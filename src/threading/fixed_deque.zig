@@ -16,61 +16,58 @@ pub fn FixedDeque(comptime T: type, comptime size: usize) type {
         const Self = @This();
 
         buffer: [size]T,
-        bottom: i32,
-        top: i32,
+        bottom: std.atomic.Value(i32),
+        top: std.atomic.Value(i32),
 
         pub fn init() Self {
             return .{
                 .buffer = undefined,
-                .bottom = 0,
-                .top = 0,
+                .bottom = std.atomic.Value(i32).init(0),
+                .top = std.atomic.Value(i32).init(0),
             };
         }
 
         pub fn push(self: *Self, value: T) void {
-            const b = self.bottom;
-            debug.assert((b - self.top) < size);
+            const b = self.bottom.load(.monotonic);
+            debug.assert((b - self.top.load(.monotonic)) < size);
             self.buffer[@intCast(b & mask)] = value;
 
-            // we need to ensure the job is written before publishing b+1 is published, maybe we could use @atomicRmw instead?
-            asm volatile ("" ::: "memory");
-            self.bottom = b + 1;
+            // Use release store to ensure the job is written before publishing b+1
+            self.bottom.store(b + 1, .release);
         }
 
         pub fn pop(self: *Self) ?T {
-            const b = self.bottom - 1;
+            const b = self.bottom.load(.monotonic) - 1;
 
-            _ = @atomicRmw(i32, &self.bottom, .Xchg, b, .seq_cst);
+            // Use seq_cst to ensure ordering with steal()
+            _ = self.bottom.rmw(.Xchg, b, .seq_cst);
 
-            const t = self.top;
+            const t = self.top.load(.seq_cst);
 
             if (t <= b) {
                 var item: ?T = self.buffer[@intCast(b & mask)];
                 if (t != b) {
                     return item;
                 }
-                if (@cmpxchgStrong(i32, &self.top, t, t + 1, .seq_cst, .seq_cst) != null) {
+                if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .seq_cst) != null) {
                     item = null;
                 }
 
-                self.bottom = t + 1;
+                self.bottom.store(t + 1, .monotonic);
                 return item;
             }
 
-            self.bottom = t;
+            self.bottom.store(t, .monotonic);
             return null;
         }
 
         pub fn steal(self: *Self) ?T {
-            const t = self.top;
-
-            // ensure top is read before bottom, maybe we could use @atomicLoad instead.
-            asm volatile ("" ::: "memory");
-            const b = self.bottom;
+            const t = self.top.load(.acquire);
+            const b = self.bottom.load(.acquire);
 
             if (t < b) {
                 const item = self.buffer[@intCast(t & mask)];
-                if (@cmpxchgStrong(i32, &self.top, t, t + 1, .seq_cst, .seq_cst) != null) {
+                if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .seq_cst) != null) {
                     return null;
                 }
                 return item;
@@ -79,13 +76,13 @@ pub fn FixedDeque(comptime T: type, comptime size: usize) type {
         }
 
         pub fn reset(self: *Self) void {
-            @atomicStore(i32, self.bottom, 0, .acq_rel);
-            @atomicStore(i32, &self.top, 0, .acq_rel);
+            self.bottom.store(0, .release);
+            self.top.store(0, .release);
         }
 
         /// NOT THREAD SAFE
         pub fn len(self: *const Self) u32 {
-            return @intCast(self.bottom - self.top);
+            return @intCast(self.bottom.load(.monotonic) - self.top.load(.monotonic));
         }
     };
 }

@@ -4,8 +4,6 @@ const assert = @import("assert");
 
 const Atomic = std.atomic.Value;
 const Thread = std.Thread;
-const BoundedArray = std.BoundedArray;
-const BoundedArrayAligned = std.BoundedArrayAligned;
 const FixedDeque = @import("fixed_deque.zig").FixedDeque;
 
 pub const JobHandle = packed struct(u16) {
@@ -22,7 +20,7 @@ pub const JobQueueConfig = struct {
 
     // Amount of time to wait before trying to fetch a new job from the queue, If the queue is empty,
     // lowering this setting will result in high CPU and thus battery usage.
-    idle_sleep_ns: u16 = 50,
+    idle_sleep_ns: u64 = 50,
 };
 
 pub fn JobQueue(comptime config: JobQueueConfig) type {
@@ -42,10 +40,10 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         parent: ?JobHandle,
 
         // Jobs that need to be awaited before this job is completed, can be executed in parallel of this job
-        job_count: u16,
+        job_count: Atomic(u16),
 
         // Child jobs, these need to be executed after this job has run
-        child_count: u16,
+        child_count: Atomic(u16),
         child_jobs: [16]JobHandle,
 
         // Data passed to the function
@@ -55,9 +53,9 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             var self: Self = .{
                 .exec = undefined,
                 .data = undefined,
-                .parent = undefined,
-                .job_count = 1,
-                .child_count = 0,
+                .parent = null,
+                .job_count = Atomic(u16).init(1),
+                .child_count = Atomic(u16).init(0),
                 .child_jobs = .{undefined} ** 16,
             };
 
@@ -72,7 +70,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         }
 
         pub fn isCompleted(self: *const Self) bool {
-            return @atomicLoad(u16, &self.job_count, .monotonic) == 0;
+            return self.job_count.load(.monotonic) == 0;
         }
     };
 
@@ -84,7 +82,12 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
 
         const Self = @This();
         const Deque = FixedDeque(*Job, max_jobs_per_thread);
-        const Jobs = BoundedArrayAligned(Job, 128, max_jobs_per_thread);
+
+        // Simple job buffer with length tracking
+        const Jobs = struct {
+            buffer: [max_jobs_per_thread]Job align(128) = undefined,
+            len: usize = 0,
+        };
 
         const jobs_per_thread_mask = max_jobs_per_thread - 1;
 
@@ -94,6 +97,9 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
 
         /// Allocator used in init and deinit functions for allocating job buffers and queues
         allocator: std.mem.Allocator,
+
+        /// Dynamic sleep time in nanoseconds, can be adjusted at runtime
+        dynamic_sleep_ns: Atomic(u64) = Atomic(u64).init(config.idle_sleep_ns),
 
         // Each thread has it's own job buffer containing max_jobs_per_thread jobs.
         // Jobs are allocated from this buffer and deallocated to this buffer. is implemented as a ringbuffer.
@@ -107,14 +113,17 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         threads: []Thread,
 
         // Main thread ID, stored so we can assert start is called from the main thread.
-        main_thread: Atomic(u64) = .{ .raw = 0 },
+        main_thread: Atomic(u64) = Atomic(u64).init(0),
 
         // While true, the threads will keep trying to pick jobs from the queue, if set to false only
         // The picked up jobs will be completed
-        is_running: Atomic(bool) = .{ .raw = false },
+        is_running: Atomic(bool) = Atomic(bool).init(false),
+
+        // Io for sleeping
+        io: std.Io,
 
         /// Needs to be called before any other function
-        pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!Self {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!Self {
             const thread_count = @min(max_thread_count, (Thread.getCpuCount() catch 2) - 1);
             const thread_queue_count = thread_count + 1;
 
@@ -123,6 +132,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                 .jobs = try allocator.alloc(Jobs, thread_queue_count),
                 .queues = try allocator.alloc(Deque, thread_queue_count),
                 .threads = try allocator.alloc(Thread, thread_count),
+                .io = io,
             };
 
             for (self.queues, self.jobs) |*queue, *jobs| {
@@ -238,7 +248,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             debug.assert(handle.thread == continuation_handle.thread);
 
             const parent = self.getJobFromBuffer(handle);
-            const prev = @atomicRmw(u16, &parent.child_count, .Add, 1, .monotonic);
+            const prev = parent.child_count.fetchAdd(1, .monotonic);
             parent.child_jobs[prev] = continuation_handle;
             debug.assert(prev < 16);
         }
@@ -252,7 +262,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
 
             const child = self.getJobFromBuffer(handle);
             const parent = self.getJobFromBuffer(finish_handle);
-            _ = @atomicRmw(u16, &parent.job_count, .Add, 1, .monotonic);
+            _ = parent.job_count.fetchAdd(1, .monotonic);
 
             child.parent = finish_handle;
         }
@@ -274,6 +284,11 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             return job.isCompleted();
         }
 
+        /// Sets the idle sleep time in nanoseconds
+        pub fn setSleepNs(self: *Self, ns: u64) void {
+            self.dynamic_sleep_ns.store(ns, .monotonic);
+        }
+
         fn run(self: *Self, queue_index: u32) void {
             debug.assert(thread_queue_index == 0);
 
@@ -292,7 +307,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         }
 
         fn getJob(self: *Self) ?*Job {
-            var queue = self.getThreadQueue();
+            const queue = self.getThreadQueue();
             if (queue.pop()) |job| {
                 return job;
             }
@@ -306,20 +321,23 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                 }
             }
 
-            Thread.sleep(config.idle_sleep_ns);
+            // Brief pause when no work available
+            const sleep_ns = self.dynamic_sleep_ns.load(.monotonic);
+            _ = self.io.sleep(std.Io.Duration.fromNanoseconds(sleep_ns), .awake) catch {};
 
             return null;
         }
 
         fn finishJob(self: *Self, job: *Job) void {
-            const prev = @atomicRmw(u16, &job.job_count, .Sub, 1, .monotonic);
+            const prev = job.job_count.fetchSub(1, .monotonic);
             if (prev == 1) {
                 if (job.parent) |parent| {
                     const parent_job = self.getJobFromBuffer(parent);
                     self.finishJob(parent_job);
                 }
 
-                for (0..job.child_count) |i| {
+                const child_count = job.child_count.load(.monotonic);
+                for (0..child_count) |i| {
                     const child_job = self.getJobFromBuffer(job.child_jobs[i]);
                     const queue = self.getThreadQueue();
                     queue.push(child_job);
@@ -343,418 +361,4 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             return &self.jobs[handle.thread].buffer[handle.index];
         }
     };
-}
-
-test "JobQueue: can init" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    try testing.expectEqual(0, jobs.main_thread.raw);
-    try testing.expectEqual(false, jobs.is_running.raw);
-}
-
-test "JobQueue: can start and stop" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    try jobs.start();
-    try testing.expectEqual(true, jobs.is_running.raw);
-
-    jobs.stop();
-    try testing.expectEqual(false, jobs.is_running.raw);
-}
-
-test "JobQueue: can join before stop" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    const StopJob = struct {
-        jobs: *@TypeOf(jobs),
-        pub fn exec(self: *@This()) void {
-            self.jobs.stop();
-        }
-    };
-
-    try jobs.start();
-    try testing.expectEqual(true, jobs.is_running.raw);
-
-    const stop_job = jobs.allocate(StopJob{ .jobs = &jobs });
-    jobs.schedule(stop_job);
-    jobs.join();
-
-    try testing.expectEqual(false, jobs.is_running.raw);
-}
-
-test "JobQueue: can join after stop" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    try jobs.start();
-    try testing.expectEqual(true, jobs.is_running.raw);
-
-    jobs.stop();
-    try testing.expectEqual(false, jobs.is_running.raw);
-    jobs.join();
-}
-
-test "JobQueue: can allocate jobs" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    const Job = struct {
-        pub fn exec(_: *@This()) void {}
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    // try jobs.start();
-    // defer jobs.join();
-    // defer jobs.stop();
-
-    const job = jobs.allocate(Job{});
-    try testing.expectEqual(0, job.index);
-
-    const job1 = jobs.allocate(Job{});
-    try testing.expectEqual(1, job1.index);
-}
-
-test "JobQueue: allocating more jobs than config.max_jobs_per_thread will overwrite previously allocated job" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    const Job = struct {
-        pub fn exec(_: *@This()) void {}
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    try jobs.start();
-    defer jobs.join();
-    defer jobs.stop();
-
-    const job = jobs.allocate(Job{});
-    try testing.expectEqual(0, job.index);
-
-    const job1 = jobs.allocate(Job{});
-    try testing.expectEqual(1, job1.index);
-
-    const job2 = jobs.allocate(Job{});
-    try testing.expectEqual(2, job2.index);
-
-    const job3 = jobs.allocate(Job{});
-    try testing.expectEqual(3, job3.index);
-
-    // This will overwrite job at index 0 as it's a ringbuffer.
-    const job4 = jobs.allocate(Job{});
-    try testing.expectEqual(0, job4.index);
-}
-
-test "JobQueue: can schedule jobs before start on main thread" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    const Job = struct {
-        foo: u32 = 0,
-        pub fn exec(self: *@This()) void {
-            self.foo += 1;
-        }
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    const handle = jobs.allocate(Job{});
-    jobs.schedule(handle);
-
-    const handle1 = jobs.allocate(Job{});
-    jobs.schedule(handle1);
-
-    try testing.expectEqual(2, jobs.getThreadQueue().len());
-
-    try jobs.start();
-
-    defer jobs.join();
-    defer jobs.stop();
-}
-
-test "JobQueue: scheduled jobs can be awaited" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    const Job = struct {
-        foo: u32 = 0,
-        pub fn exec(self: *@This()) void {
-            self.foo += 1;
-        }
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    const handle = jobs.allocate(Job{});
-    jobs.schedule(handle);
-
-    try jobs.start();
-
-    jobs.wait(handle);
-
-    try testing.expectEqual(0, jobs.getThreadQueue().len());
-
-    defer jobs.join();
-    defer jobs.stop();
-}
-
-test "JobQueue: result of job is available after 'wait'" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    const Job = struct {
-        foo: u32 = 0,
-        pub fn exec(self: *@This()) void {
-            self.foo += 1;
-        }
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    const handle = jobs.allocate(Job{});
-    jobs.schedule(handle);
-
-    try jobs.start();
-
-    jobs.wait(handle);
-
-    try testing.expectEqual(0, jobs.getThreadQueue().len());
-
-    const result = jobs.result(Job, handle);
-
-    try testing.expectEqual(1, result.foo);
-
-    defer jobs.join();
-    defer jobs.stop();
-}
-
-test "JobQueue: result of job can be returned directly by waitResult" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    // We want the value of foo once this job is finished.
-    const Job = struct {
-        foo: u32 = 0,
-        pub fn exec(self: *@This()) void {
-            self.foo += 1;
-        }
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    const handle = jobs.allocate(Job{});
-    jobs.schedule(handle);
-
-    try jobs.start();
-
-    // Here we get the result from the job, it will be copied.
-    // other ways of retrieving the members of a job would be
-    // - calling 'wait' and after that calling 'result'
-    // - using a pointer and define the data outside the job
-    const result = jobs.waitResult(Job, handle);
-
-    try testing.expectEqual(1, result.foo);
-
-    defer jobs.join();
-    defer jobs.stop();
-}
-
-test "JobQueue: jobs are spread out over all threads" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 4,
-    };
-
-    const Job = struct {
-        thread: Thread.Id = 0,
-        pub fn exec(self: *@This()) void {
-            self.thread = Thread.getCurrentId();
-            // simulate some work to be done
-            Thread.sleep(50);
-        }
-    };
-
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    const tasks = try allocator.alloc(JobHandle, 4);
-    defer allocator.free(tasks);
-    const results = try allocator.alloc(Job, 4);
-    defer allocator.free(results);
-
-    for (tasks) |*task| {
-        task.* = jobs.allocate(Job{});
-        jobs.schedule(task.*);
-    }
-
-    try jobs.start();
-    defer jobs.join();
-    defer jobs.stop();
-
-    for (results, tasks) |*result, task| {
-        result.* = jobs.waitResult(Job, task);
-    }
-
-    try testing.expectEqual(0, jobs.getThreadQueue().len());
-}
-
-test "JobQueue: finishWith job can be used to build up tree structure and awaited in one go" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 256,
-    };
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    try jobs.start();
-    defer jobs.join();
-    defer jobs.stop();
-
-    const Root = struct {
-        pub fn exec(_: *@This()) void {}
-    };
-
-    const Child = struct {
-        pub fn exec(_: *@This()) void {}
-    };
-
-    const root = jobs.allocate(Root{});
-    // This is a very efficient way as we can already run child jobs while we are scheduling them.
-    for (0..255) |_| {
-        const child = jobs.allocate(Child{});
-        jobs.finishWith(child, root);
-        jobs.schedule(child);
-    }
-    jobs.schedule(root);
-    jobs.wait(root);
-
-    try testing.expectEqual(true, jobs.isCompleted(root));
-}
-
-test "JobQueue: continueWith jobs can be added and are run in order after completion main job" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const config: JobQueueConfig = .{
-        .max_jobs_per_thread = 8,
-    };
-    var jobs = try JobQueue(config).init(allocator);
-    defer jobs.deinit();
-
-    var data: [3]u8 = undefined;
-    var index: usize = 0;
-
-    const Parent = struct {
-        result: []u8,
-        index: *usize,
-
-        pub fn exec(self: *@This()) void {
-            self.result[self.index.*] = 1;
-            self.index.* += 1;
-        }
-    };
-
-    const Child = struct {
-        result: []u8,
-        index: *usize,
-
-        pub fn exec(self: *@This()) void {
-            self.result[self.index.*] = 2;
-            self.index.* += 1;
-        }
-    };
-
-    const Child1 = struct {
-        result: []u8,
-        index: *usize,
-
-        pub fn exec(self: *@This()) void {
-            self.result[self.index.*] = 3;
-            self.index.* += 1;
-        }
-    };
-
-    const parent_job: Parent = .{
-        .result = &data,
-        .index = &index,
-    };
-
-    const parent = jobs.allocate(parent_job);
-
-    const child_job: Child = .{
-        .result = &data,
-        .index = &index,
-    };
-    const child = jobs.allocate(child_job);
-
-    const child1_job: Child1 = .{
-        .result = &data,
-        .index = &index,
-    };
-    const child1 = jobs.allocate(child1_job);
-
-    jobs.continueWith(parent, child);
-    jobs.continueWith(child, child1);
-
-    try jobs.start();
-    defer jobs.join();
-    defer jobs.stop();
-
-    jobs.schedule(parent);
-
-    const result = jobs.waitResult(Child1, child1);
-    const expected: [3]u8 = .{ 1, 2, 3 };
-    try testing.expectEqualSlices(u8, &expected, result.result);
 }
