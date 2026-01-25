@@ -21,6 +21,9 @@ pub const JobQueueConfig = struct {
     // Amount of time to wait before trying to fetch a new job from the queue, If the queue is empty,
     // lowering this setting will result in high CPU and thus battery usage.
     idle_sleep_ns: u64 = 50,
+
+    // When dynamic sleep exceeds this threshold, prefer condition waits over timed sleeps.
+    park_threshold_ns: u64 = 100_000, // 100us
 };
 
 pub fn JobQueue(comptime config: JobQueueConfig) type {
@@ -79,6 +82,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         pub const sleep_time_ns = config.idle_sleep_ns;
         const max_thread_count = config.max_threads;
         const max_thread_queue_count = max_thread_count + 1;
+        const park_threshold_ns = config.park_threshold_ns;
 
         const Self = @This();
         const Deque = FixedDeque(*Job, max_jobs_per_thread);
@@ -100,6 +104,14 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
 
         /// Dynamic sleep time in nanoseconds, can be adjusted at runtime
         dynamic_sleep_ns: Atomic(u64) = Atomic(u64).init(config.idle_sleep_ns),
+
+        /// Used to park worker threads when idle for longer durations.
+        wait_mutex: std.Thread.Mutex = .{},
+        wait_cond: std.Thread.Condition = .{},
+        work_counter: Atomic(u64) = Atomic(u64).init(0),
+        waiters: Atomic(u32) = Atomic(u32).init(0),
+        queued_jobs: Atomic(u32) = Atomic(u32).init(0),
+        waiting_on_jobs: Atomic(u32) = Atomic(u32).init(0),
 
         // Each thread has it's own job buffer containing max_jobs_per_thread jobs.
         // Jobs are allocated from this buffer and deallocated to this buffer. is implemented as a ringbuffer.
@@ -173,6 +185,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         pub fn stop(self: *Self) void {
             const was_running = self.is_running.swap(false, .monotonic);
             debug.assert(was_running);
+            self.notifyAll();
         }
 
         /// Joins all threads again, you can call this before stop but than a Job on another thread
@@ -209,7 +222,15 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             const queue = self.getThreadQueue();
             const job = self.getJobFromBuffer(handle);
 
+            _ = self.queued_jobs.fetchAdd(1, .acq_rel);
             queue.push(job);
+            // Only signal if threads might be parked (idle mode)
+            // Avoids mutex overhead in hot path under high load
+            if (self.dynamic_sleep_ns.load(.monotonic) >= park_threshold_ns) {
+                self.wait_mutex.lock();
+                self.wait_cond.signal();
+                self.wait_mutex.unlock();
+            }
         }
 
         /// awaits the job to finish and while not finished yet will work on other jobs.
@@ -217,6 +238,8 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             debug.assert(handle.thread == thread_queue_index);
 
             const job = self.getJobFromBuffer(handle);
+            _ = self.waiting_on_jobs.fetchAdd(1, .release);
+            defer _ = self.waiting_on_jobs.fetchSub(1, .release);
             while (!job.isCompleted()) {
                 self.execNextJob();
             }
@@ -228,6 +251,8 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             debug.assert(handle.thread == thread_queue_index);
 
             const job = self.getJobFromBuffer(handle);
+            _ = self.waiting_on_jobs.fetchAdd(1, .release);
+            defer _ = self.waiting_on_jobs.fetchSub(1, .release);
             while (!job.isCompleted()) {
                 self.execNextJob();
             }
@@ -309,6 +334,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         fn getJob(self: *Self) ?*Job {
             const queue = self.getThreadQueue();
             if (queue.pop()) |job| {
+                _ = self.queued_jobs.fetchSub(1, .acq_rel);
                 return job;
             }
 
@@ -317,13 +343,35 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                 debug.assert(thread_queue_index != index);
 
                 if (self.queues[index].steal()) |job| {
+                    _ = self.queued_jobs.fetchSub(1, .acq_rel);
                     return job;
                 }
             }
 
             // Brief pause when no work available
             const sleep_ns = self.dynamic_sleep_ns.load(.monotonic);
-            _ = self.io.sleep(std.Io.Duration.fromNanoseconds(sleep_ns), .awake) catch {};
+            const in_wait = self.waiting_on_jobs.load(.acquire) > 0;
+            if (sleep_ns >= park_threshold_ns) {
+                self.wait_mutex.lock();
+                defer self.wait_mutex.unlock();
+                if (self.queued_jobs.load(.acquire) == 0) {
+                    _ = self.waiters.fetchAdd(1, .monotonic);
+                    defer _ = self.waiters.fetchSub(1, .monotonic);
+                    // When someone is waiting on job completion, only wait briefly then return
+                    // so the caller can check if its job completed (even with empty queue).
+                    if (in_wait) {
+                        self.wait_cond.timedWait(&self.wait_mutex, 10_000) catch {}; // 10us
+                    } else {
+                        // Idle case: wait longer, but still use timedWait to handle shutdown
+                        while (self.is_running.load(.monotonic) and self.queued_jobs.load(.acquire) == 0) {
+                            self.wait_cond.timedWait(&self.wait_mutex, sleep_ns) catch {};
+                        }
+                    }
+                }
+            } else if (!in_wait) {
+                // Only sleep when nobody is waiting on jobs
+                _ = self.io.sleep(std.Io.Duration.fromNanoseconds(sleep_ns), .awake) catch {};
+            }
 
             return null;
         }
@@ -337,12 +385,45 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                 }
 
                 const child_count = job.child_count.load(.monotonic);
+                if (child_count > 0) {
+                    _ = self.queued_jobs.fetchAdd(@intCast(child_count), .acq_rel);
+                }
                 for (0..child_count) |i| {
                     const child_job = self.getJobFromBuffer(job.child_jobs[i]);
                     const queue = self.getThreadQueue();
                     queue.push(child_job);
                 }
+                if (child_count > 0 and self.dynamic_sleep_ns.load(.monotonic) >= park_threshold_ns) {
+                    // Only signal if threads might be parked (idle mode)
+                    self.wait_mutex.lock();
+                    for (0..child_count) |_| self.wait_cond.signal();
+                    self.wait_mutex.unlock();
+                }
             }
+        }
+
+        fn notifyOne(self: *Self) void {
+            self.wait_mutex.lock();
+            defer self.wait_mutex.unlock();
+            _ = self.work_counter.fetchAdd(1, .monotonic);
+            self.wait_cond.signal();
+        }
+
+        fn notifyMany(self: *Self, count: u32) void {
+            if (count == 0) return;
+            self.wait_mutex.lock();
+            defer self.wait_mutex.unlock();
+            _ = self.work_counter.fetchAdd(1, .monotonic);
+            for (0..count) |_| {
+                self.wait_cond.signal();
+            }
+        }
+
+        fn notifyAll(self: *Self) void {
+            self.wait_mutex.lock();
+            defer self.wait_mutex.unlock();
+            _ = self.work_counter.fetchAdd(1, .monotonic);
+            self.wait_cond.broadcast();
         }
 
         inline fn getThreadQueue(self: *Self) *Deque {
