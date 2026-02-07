@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug = std.debug;
 const assert = @import("assert");
+const builtin = @import("builtin");
 
 const Atomic = std.atomic.Value;
 const Thread = std.Thread;
@@ -24,6 +25,86 @@ pub const JobQueueConfig = struct {
 
     // When dynamic sleep exceeds this threshold, prefer condition waits over timed sleeps.
     park_threshold_ns: u64 = 100_000, // 100us
+};
+
+/// Direct futex operations bypassing the std.Io VTable layer.
+/// Uses platform-native syscalls for minimal overhead on the wake path.
+const Futex = struct {
+    const native_os = builtin.os.tag;
+    const is_darwin = native_os.isDarwin();
+
+    /// Blocks the calling thread if `ptr.*` == `expect`.
+    /// Returns when woken by `wake()`, when `ptr.*` != `expect`, or when `timeout_ns` expires.
+    fn timedWait(ptr: *const Atomic(u32), expect: u32, timeout_ns: ?u64) void {
+        if (is_darwin) {
+            const c = std.c;
+            const flags: c.UL = .{
+                .op = .COMPARE_AND_WAIT,
+                .NO_ERRNO = true,
+            };
+            // __ulock_wait2 uses nanosecond timeouts (0 = infinite).
+            // Available on macOS 11+. For older targets, fall back to __ulock_wait (microseconds).
+            const darwin_has_wait2 = comptime builtin.os.version_range.semver.min.major >= 11;
+            if (darwin_has_wait2) {
+                _ = c.__ulock_wait2(flags, @ptrCast(&ptr.raw), expect, timeout_ns orelse 0, 0);
+            } else {
+                const us: u32 = if (timeout_ns) |ns|
+                    std.math.lossyCast(u32, ns / std.time.ns_per_us)
+                else
+                    0;
+                _ = c.__ulock_wait(flags, @ptrCast(&ptr.raw), expect, if (us == 0 and timeout_ns != null) 1 else us);
+            }
+        } else if (native_os == .linux) {
+            const linux = std.os.linux;
+            var ts_buf: linux.timespec = undefined;
+            const ts: ?*linux.timespec = if (timeout_ns) |ns| blk: {
+                ts_buf = .{
+                    .sec = @intCast(ns / std.time.ns_per_s),
+                    .nsec = @intCast(ns % std.time.ns_per_s),
+                };
+                break :blk &ts_buf;
+            } else null;
+            _ = linux.futex_4arg(
+                @ptrCast(&ptr.raw),
+                .{ .cmd = .WAIT, .private = true },
+                expect,
+                ts,
+            );
+        } else {
+            @compileError("Futex.timedWait not implemented for this OS");
+        }
+    }
+
+    /// Wakes up to `max_waiters` threads blocked in `timedWait` on the same address.
+    fn wake(ptr: *const Atomic(u32), max_waiters: u32) void {
+        debug.assert(max_waiters != 0);
+        if (is_darwin) {
+            const c = std.c;
+            const flags: c.UL = .{
+                .op = .COMPARE_AND_WAIT,
+                .NO_ERRNO = true,
+                .WAKE_ALL = max_waiters > 1,
+            };
+            while (true) {
+                const status = c.__ulock_wake(flags, @ptrCast(&ptr.raw), 0);
+                if (status >= 0) return;
+                switch (@as(c.E, @enumFromInt(-status))) {
+                    .INTR, .CANCELED => continue,
+                    .NOENT => return, // no waiters
+                    else => return,
+                }
+            }
+        } else if (native_os == .linux) {
+            const linux = std.os.linux;
+            _ = linux.futex_3arg(
+                @ptrCast(&ptr.raw),
+                .{ .cmd = .WAKE, .private = true },
+                @min(max_waiters, std.math.maxInt(i32)),
+            );
+        } else {
+            @compileError("Futex.wake not implemented for this OS");
+        }
+    }
 };
 
 pub fn JobQueue(comptime config: JobQueueConfig) type {
@@ -105,10 +186,12 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         /// Dynamic sleep time in nanoseconds, can be adjusted at runtime
         dynamic_sleep_ns: Atomic(u64) = Atomic(u64).init(config.idle_sleep_ns),
 
-        /// Used to park worker threads when idle for longer durations.
-        wait_mutex: std.Thread.Mutex = .{},
-        wait_cond: std.Thread.Condition = .{},
-        work_counter: Atomic(u64) = Atomic(u64).init(0),
+        /// Monotonic epoch counter for futex-based parking.
+        /// Incremented on every schedule/notify to wake parked workers.
+        /// Workers snapshot this before checking for work; if it changes
+        /// between snapshot and futex_wait, the wait returns immediately
+        /// (no lost wakes).
+        park_epoch: Atomic(u32) = Atomic(u32).init(0),
         waiters: Atomic(u32) = Atomic(u32).init(0),
         queued_jobs: Atomic(u32) = Atomic(u32).init(0),
         waiting_on_jobs: Atomic(u32) = Atomic(u32).init(0),
@@ -225,11 +308,12 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             _ = self.queued_jobs.fetchAdd(1, .acq_rel);
             queue.push(job);
             // Only signal if threads might be parked (idle mode)
-            // Avoids mutex overhead in hot path under high load
+            // Avoids futex overhead in hot path under high load
             if (self.dynamic_sleep_ns.load(.monotonic) >= park_threshold_ns) {
-                self.wait_mutex.lock();
-                self.wait_cond.signal();
-                self.wait_mutex.unlock();
+                // Bump epoch AFTER push+queued_jobs so the worker that wakes
+                // will observe the new job via acquire on park_epoch.
+                _ = self.park_epoch.fetchAdd(1, .release);
+                Futex.wake(&self.park_epoch, 1);
             }
         }
 
@@ -352,19 +436,23 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             const sleep_ns = self.dynamic_sleep_ns.load(.monotonic);
             const in_wait = self.waiting_on_jobs.load(.acquire) > 0;
             if (sleep_ns >= park_threshold_ns) {
-                self.wait_mutex.lock();
-                defer self.wait_mutex.unlock();
+                // Snapshot epoch BEFORE checking queued_jobs.
+                // If a scheduler pushes between our check and the futex_wait,
+                // it will bump park_epoch, and our futex_wait sees
+                // park_epoch != epoch → returns immediately (no lost wake).
+                var epoch = self.park_epoch.load(.acquire);
                 if (self.queued_jobs.load(.acquire) == 0) {
                     _ = self.waiters.fetchAdd(1, .monotonic);
                     defer _ = self.waiters.fetchSub(1, .monotonic);
                     // When someone is waiting on job completion, only wait briefly then return
                     // so the caller can check if its job completed (even with empty queue).
                     if (in_wait) {
-                        self.wait_cond.timedWait(&self.wait_mutex, 10_000) catch {}; // 10us
+                        Futex.timedWait(&self.park_epoch, epoch, 10_000); // 10us
                     } else {
-                        // Idle case: wait longer, but still use timedWait to handle shutdown
+                        // Idle case: wait longer, but still use timed wait to handle shutdown
                         while (self.is_running.load(.monotonic) and self.queued_jobs.load(.acquire) == 0) {
-                            self.wait_cond.timedWait(&self.wait_mutex, sleep_ns) catch {};
+                            Futex.timedWait(&self.park_epoch, epoch, sleep_ns);
+                            epoch = self.park_epoch.load(.acquire);
                         }
                     }
                 }
@@ -394,36 +482,27 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                     queue.push(child_job);
                 }
                 if (child_count > 0 and self.dynamic_sleep_ns.load(.monotonic) >= park_threshold_ns) {
-                    // Only signal if threads might be parked (idle mode)
-                    self.wait_mutex.lock();
-                    for (0..child_count) |_| self.wait_cond.signal();
-                    self.wait_mutex.unlock();
+                    // Wake parked workers for newly pushed child jobs
+                    _ = self.park_epoch.fetchAdd(1, .release);
+                    Futex.wake(&self.park_epoch, @intCast(child_count));
                 }
             }
         }
 
         fn notifyOne(self: *Self) void {
-            self.wait_mutex.lock();
-            defer self.wait_mutex.unlock();
-            _ = self.work_counter.fetchAdd(1, .monotonic);
-            self.wait_cond.signal();
+            _ = self.park_epoch.fetchAdd(1, .release);
+            Futex.wake(&self.park_epoch, 1);
         }
 
         fn notifyMany(self: *Self, count: u32) void {
             if (count == 0) return;
-            self.wait_mutex.lock();
-            defer self.wait_mutex.unlock();
-            _ = self.work_counter.fetchAdd(1, .monotonic);
-            for (0..count) |_| {
-                self.wait_cond.signal();
-            }
+            _ = self.park_epoch.fetchAdd(1, .release);
+            Futex.wake(&self.park_epoch, count);
         }
 
         fn notifyAll(self: *Self) void {
-            self.wait_mutex.lock();
-            defer self.wait_mutex.unlock();
-            _ = self.work_counter.fetchAdd(1, .monotonic);
-            self.wait_cond.broadcast();
+            _ = self.park_epoch.fetchAdd(1, .release);
+            Futex.wake(&self.park_epoch, std.math.maxInt(u32));
         }
 
         inline fn getThreadQueue(self: *Self) *Deque {
