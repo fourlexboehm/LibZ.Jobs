@@ -1,7 +1,7 @@
 .{
     .name = .libz_jobs,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0-dev.2193+fc517bd01",
+    .minimum_zig_version = "0.16.0",
     .fingerprint = 0x16fe4426811b3258,
     .dependencies = .{},
     .paths = .{
