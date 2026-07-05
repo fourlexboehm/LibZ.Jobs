@@ -140,7 +140,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                 .parent = null,
                 .job_count = Atomic(u16).init(1),
                 .child_count = Atomic(u16).init(0),
-                .child_jobs = .{undefined} ** 16,
+                .child_jobs = @splat(undefined),
             };
 
             const bytes = std.mem.asBytes(job);
