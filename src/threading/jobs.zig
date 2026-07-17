@@ -22,9 +22,6 @@ pub const JobQueueConfig = struct {
     // Amount of time to wait before trying to fetch a new job from the queue, If the queue is empty,
     // lowering this setting will result in high CPU and thus battery usage.
     idle_sleep_ns: u64 = 50,
-
-    // When dynamic sleep exceeds this threshold, prefer condition waits over timed sleeps.
-    park_threshold_ns: u64 = 100_000, // 100us
 };
 
 /// Direct futex operations bypassing the std.Io VTable layer.
@@ -163,7 +160,6 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         pub const sleep_time_ns = config.idle_sleep_ns;
         const max_thread_count = config.max_threads;
         const max_thread_queue_count = max_thread_count + 1;
-        const park_threshold_ns = config.park_threshold_ns;
 
         const Self = @This();
         const Deque = FixedDeque(*Job, max_jobs_per_thread);
@@ -194,7 +190,6 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         park_epoch: Atomic(u32) = Atomic(u32).init(0),
         waiters: Atomic(u32) = Atomic(u32).init(0),
         queued_jobs: Atomic(u32) = Atomic(u32).init(0),
-        waiting_on_jobs: Atomic(u32) = Atomic(u32).init(0),
 
         // Each thread has it's own job buffer containing max_jobs_per_thread jobs.
         // Jobs are allocated from this buffer and deallocated to this buffer. is implemented as a ringbuffer.
@@ -307,14 +302,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
 
             _ = self.queued_jobs.fetchAdd(1, .acq_rel);
             queue.push(job);
-            // Only signal if threads might be parked (idle mode)
-            // Avoids futex overhead in hot path under high load
-            if (self.dynamic_sleep_ns.load(.monotonic) >= park_threshold_ns) {
-                // Bump epoch AFTER push+queued_jobs so the worker that wakes
-                // will observe the new job via acquire on park_epoch.
-                _ = self.park_epoch.fetchAdd(1, .release);
-                Futex.wake(&self.park_epoch, 1);
-            }
+            self.notifyOne();
         }
 
         /// awaits the job to finish and while not finished yet will work on other jobs.
@@ -322,10 +310,19 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             debug.assert(handle.thread == thread_queue_index);
 
             const job = self.getJobFromBuffer(handle);
-            _ = self.waiting_on_jobs.fetchAdd(1, .release);
-            defer _ = self.waiting_on_jobs.fetchSub(1, .release);
             while (!job.isCompleted()) {
                 self.execNextJob();
+            }
+        }
+
+        /// Waits without parking the caller. Intended for realtime threads that
+        /// must continue helping until the target job completes.
+        pub fn waitRealtime(self: *Self, handle: JobHandle) void {
+            debug.assert(handle.thread == thread_queue_index);
+
+            const job = self.getJobFromBuffer(handle);
+            while (!job.isCompleted()) {
+                if (!self.tryExecNextJob()) std.atomic.spinLoopHint();
             }
         }
 
@@ -335,8 +332,6 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             debug.assert(handle.thread == thread_queue_index);
 
             const job = self.getJobFromBuffer(handle);
-            _ = self.waiting_on_jobs.fetchAdd(1, .release);
-            defer _ = self.waiting_on_jobs.fetchSub(1, .release);
             while (!job.isCompleted()) {
                 self.execNextJob();
             }
@@ -409,10 +404,16 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         }
 
         fn execNextJob(self: *Self) void {
+            if (!self.tryExecNextJob()) self.parkWorker();
+        }
+
+        fn tryExecNextJob(self: *Self) bool {
             if (self.getJob()) |job| {
                 job.exec(&job.data);
                 self.finishJob(job);
+                return true;
             }
+            return false;
         }
 
         fn getJob(self: *Self) ?*Job {
@@ -432,36 +433,20 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                 }
             }
 
-            // Brief pause when no work available
-            const sleep_ns = self.dynamic_sleep_ns.load(.monotonic);
-            const in_wait = self.waiting_on_jobs.load(.acquire) > 0;
-            if (sleep_ns >= park_threshold_ns) {
-                // Snapshot epoch BEFORE checking queued_jobs.
-                // If a scheduler pushes between our check and the futex_wait,
-                // it will bump park_epoch, and our futex_wait sees
-                // park_epoch != epoch → returns immediately (no lost wake).
-                var epoch = self.park_epoch.load(.acquire);
-                if (self.queued_jobs.load(.acquire) == 0) {
-                    _ = self.waiters.fetchAdd(1, .monotonic);
-                    defer _ = self.waiters.fetchSub(1, .monotonic);
-                    // When someone is waiting on job completion, only wait briefly then return
-                    // so the caller can check if its job completed (even with empty queue).
-                    if (in_wait) {
-                        Futex.timedWait(&self.park_epoch, epoch, 10_000); // 10us
-                    } else {
-                        // Idle case: wait longer, but still use timed wait to handle shutdown
-                        while (self.is_running.load(.monotonic) and self.queued_jobs.load(.acquire) == 0) {
-                            Futex.timedWait(&self.park_epoch, epoch, sleep_ns);
-                            epoch = self.park_epoch.load(.acquire);
-                        }
-                    }
-                }
-            } else if (!in_wait) {
-                // Only sleep when nobody is waiting on jobs
-                _ = self.io.sleep(std.Io.Duration.fromNanoseconds(sleep_ns), .awake) catch {};
-            }
-
             return null;
+        }
+
+        fn parkWorker(self: *Self) void {
+            const sleep_ns = self.dynamic_sleep_ns.load(.monotonic);
+            var epoch = self.park_epoch.load(.acquire);
+            if (self.queued_jobs.load(.acquire) == 0) {
+                _ = self.waiters.fetchAdd(1, .monotonic);
+                defer _ = self.waiters.fetchSub(1, .monotonic);
+                while (self.is_running.load(.monotonic) and self.queued_jobs.load(.acquire) == 0) {
+                    Futex.timedWait(&self.park_epoch, epoch, sleep_ns);
+                    epoch = self.park_epoch.load(.acquire);
+                }
+            }
         }
 
         fn finishJob(self: *Self, job: *Job) void {
@@ -481,10 +466,11 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                     const queue = self.getThreadQueue();
                     queue.push(child_job);
                 }
-                if (child_count > 0 and self.dynamic_sleep_ns.load(.monotonic) >= park_threshold_ns) {
-                    // Wake parked workers for newly pushed child jobs
+                if (child_count > 0) {
                     _ = self.park_epoch.fetchAdd(1, .release);
                     Futex.wake(&self.park_epoch, @intCast(child_count));
+                } else {
+                    self.notifyOne();
                 }
             }
         }
@@ -521,4 +507,53 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
             return &self.jobs[handle.thread].buffer[handle.index];
         }
     };
+}
+
+test "waitRealtime executes work instead of parking" {
+    const Queue = JobQueue(.{
+        .max_jobs_per_thread = 8,
+        .max_threads = 2,
+        .idle_sleep_ns = std.time.ns_per_s,
+    });
+    const Blocker = struct {
+        started: *Atomic(u32),
+        release: *Atomic(bool),
+
+        pub fn exec(self: *@This()) void {
+            _ = self.started.fetchAdd(1, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    const RecordThread = struct {
+        executor: *Atomic(u64),
+
+        pub fn exec(self: *@This()) void {
+            self.executor.store(Thread.getCurrentId(), .release);
+        }
+    };
+
+    var queue = try Queue.init(std.testing.allocator, std.testing.io);
+    defer queue.deinit();
+    try queue.start();
+
+    var release = Atomic(bool).init(false);
+    var started = Atomic(u32).init(0);
+    defer {
+        release.store(true, .release);
+        queue.stop();
+        queue.join();
+    }
+
+    for (0..queue.threads.len) |_| {
+        const blocker = queue.allocate(Blocker{ .started = &started, .release = &release });
+        queue.schedule(blocker);
+    }
+    while (started.load(.acquire) != queue.threads.len) std.atomic.spinLoopHint();
+
+    var executor = Atomic(u64).init(0);
+    const target = queue.allocate(RecordThread{ .executor = &executor });
+    queue.schedule(target);
+    queue.waitRealtime(target);
+
+    try std.testing.expectEqual(Thread.getCurrentId(), executor.load(.acquire));
 }
