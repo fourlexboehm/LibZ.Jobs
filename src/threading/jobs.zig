@@ -19,8 +19,8 @@ pub const JobQueueConfig = struct {
     // Dictates max number of threads
     max_threads: u16 = 32,
 
-    // Amount of time to wait before trying to fetch a new job from the queue, If the queue is empty,
-    // lowering this setting will result in high CPU and thus battery usage.
+    // Legacy tuning value retained for source compatibility. Idle workers now
+    // block until work or shutdown is published, rather than polling on a timer.
     idle_sleep_ns: u64 = 50,
 };
 
@@ -85,7 +85,7 @@ const Futex = struct {
             while (true) {
                 const status = c.__ulock_wake(flags, @ptrCast(&ptr.raw), 0);
                 if (status >= 0) return;
-                switch (@as(c.E, @enumFromInt(-status))) {
+                switch (@as(c.E, @fromBackingInt(@intCast(-status)))) {
                     .INTR, .CANCELED => continue,
                     .NOENT => return, // no waiters
                     else => return,
@@ -121,7 +121,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         parent: ?JobHandle,
 
         // Jobs that need to be awaited before this job is completed, can be executed in parallel of this job
-        job_count: Atomic(u16),
+        job_count: Atomic(u32),
 
         // Child jobs, these need to be executed after this job has run
         child_count: Atomic(u16),
@@ -135,7 +135,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                 .exec = undefined,
                 .data = undefined,
                 .parent = null,
-                .job_count = Atomic(u16).init(1),
+                .job_count = Atomic(u32).init(1),
                 .child_count = Atomic(u16).init(0),
                 .child_jobs = @splat(undefined),
             };
@@ -151,7 +151,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         }
 
         pub fn isCompleted(self: *const Self) bool {
-            return self.job_count.load(.monotonic) == 0;
+            return self.job_count.load(.acquire) == 0;
         }
     };
 
@@ -179,7 +179,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         /// Allocator used in init and deinit functions for allocating job buffers and queues
         allocator: std.mem.Allocator,
 
-        /// Dynamic sleep time in nanoseconds, can be adjusted at runtime
+        /// Legacy tuning value; idle workers no longer use timeout-based polling.
         dynamic_sleep_ns: Atomic(u64) = Atomic(u64).init(config.idle_sleep_ns),
 
         /// Monotonic epoch counter for futex-based parking.
@@ -311,7 +311,11 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
 
             const job = self.getJobFromBuffer(handle);
             while (!job.isCompleted()) {
-                self.execNextJob();
+                if (self.tryExecNextJob()) continue;
+                // Wait on this job, not the worker epoch: another job's completion
+                // must not leave us asleep, nor require waking the entire pool.
+                const remaining = job.job_count.load(.acquire);
+                if (remaining != 0) Futex.timedWait(&job.job_count, remaining, null);
             }
         }
 
@@ -331,10 +335,8 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         pub fn waitResult(self: *Self, T: type, handle: JobHandle) T {
             debug.assert(handle.thread == thread_queue_index);
 
+            self.wait(handle);
             const job = self.getJobFromBuffer(handle);
-            while (!job.isCompleted()) {
-                self.execNextJob();
-            }
             return std.mem.bytesToValue(T, &job.data);
         }
 
@@ -437,21 +439,19 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
         }
 
         fn parkWorker(self: *Self) void {
-            const sleep_ns = self.dynamic_sleep_ns.load(.monotonic);
-            var epoch = self.park_epoch.load(.acquire);
-            if (self.queued_jobs.load(.acquire) == 0) {
-                _ = self.waiters.fetchAdd(1, .monotonic);
-                defer _ = self.waiters.fetchSub(1, .monotonic);
-                while (self.is_running.load(.monotonic) and self.queued_jobs.load(.acquire) == 0) {
-                    Futex.timedWait(&self.park_epoch, epoch, sleep_ns);
-                    epoch = self.park_epoch.load(.acquire);
-                }
-            }
+            // Snapshot before checking predicates. A concurrent publication then
+            // either changes the predicate or makes the futex comparison fail.
+            const epoch = self.park_epoch.load(.acquire);
+            _ = self.waiters.fetchAdd(1, .monotonic);
+            defer _ = self.waiters.fetchSub(1, .monotonic);
+            if (!self.is_running.load(.acquire) or self.queued_jobs.load(.acquire) != 0) return;
+            Futex.timedWait(&self.park_epoch, epoch, null);
         }
 
         fn finishJob(self: *Self, job: *Job) void {
-            const prev = job.job_count.fetchSub(1, .monotonic);
+            const prev = job.job_count.fetchSub(1, .acq_rel);
             if (prev == 1) {
+                Futex.wake(&job.job_count, std.math.maxInt(u32));
                 if (job.parent) |parent| {
                     const parent_job = self.getJobFromBuffer(parent);
                     self.finishJob(parent_job);
@@ -466,12 +466,7 @@ pub fn JobQueue(comptime config: JobQueueConfig) type {
                     const queue = self.getThreadQueue();
                     queue.push(child_job);
                 }
-                if (child_count > 0) {
-                    _ = self.park_epoch.fetchAdd(1, .release);
-                    Futex.wake(&self.park_epoch, @intCast(child_count));
-                } else {
-                    self.notifyOne();
-                }
+                self.notifyMany(@intCast(child_count));
             }
         }
 
@@ -556,4 +551,111 @@ test "waitRealtime executes work instead of parking" {
     queue.waitRealtime(target);
 
     try std.testing.expectEqual(Thread.getCurrentId(), executor.load(.acquire));
+}
+
+fn waitForTestValue(value: *const Atomic(u32), expected: u32) !void {
+    const deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + std.time.ns_per_s * 2;
+    while (value.load(.acquire) != expected) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline) return error.TestTimeout;
+        try std.testing.io.sleep(.fromNanoseconds(100 * std.time.ns_per_us), .awake);
+    }
+}
+
+test "parked workers wake for successive batches without polling" {
+    const Queue = JobQueue(.{ .max_jobs_per_thread = 64, .max_threads = 2 });
+    const Count = struct {
+        count: *Atomic(u32),
+        pub fn exec(self: *@This()) void {
+            _ = self.count.fetchAdd(1, .release);
+        }
+    };
+    var queue = try Queue.init(std.testing.allocator, std.testing.io);
+    defer queue.deinit();
+    try queue.start();
+    defer {
+        queue.stop();
+        queue.join();
+    }
+    if (queue.threads.len == 0) return error.SkipZigTest;
+    var count = Atomic(u32).init(0);
+    for (0..128) |batch| {
+        try waitForTestValue(&queue.waiters, @intCast(queue.threads.len));
+        for (0..8) |_| queue.schedule(queue.allocate(Count{ .count = &count }));
+        try waitForTestValue(&count, @intCast((batch + 1) * 8));
+    }
+    try waitForTestValue(&queue.waiters, @intCast(queue.threads.len));
+}
+
+test "ordinary waitResult wakes on the target completion" {
+    const Queue = JobQueue(.{ .max_jobs_per_thread = 8, .max_threads = 2 });
+    const Result = struct {
+        started: *Atomic(u32),
+        value: u32 = 0,
+        pub fn exec(self: *@This()) void {
+            self.started.store(1, .release);
+            std.testing.io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch unreachable;
+            self.value = 42;
+        }
+    };
+    var queue = try Queue.init(std.testing.allocator, std.testing.io);
+    defer queue.deinit();
+    try queue.start();
+    defer {
+        queue.stop();
+        queue.join();
+    }
+    if (queue.threads.len == 0) return error.SkipZigTest;
+    var started = Atomic(u32).init(0);
+    const job = queue.allocate(Result{ .started = &started });
+    queue.schedule(job);
+    try waitForTestValue(&started, 1);
+    const result = queue.waitResult(Result, job);
+    try std.testing.expectEqual(@as(u32, 42), result.value);
+}
+
+test "parent completion schedules continuations for sleeping workers" {
+    const Queue = JobQueue(.{ .max_jobs_per_thread = 8, .max_threads = 2 });
+    const Noop = struct {
+        pub fn exec(_: *@This()) void {}
+    };
+    const Done = struct {
+        completed: *Atomic(u32),
+        pub fn exec(self: *@This()) void {
+            self.completed.store(1, .release);
+        }
+    };
+    var queue = try Queue.init(std.testing.allocator, std.testing.io);
+    defer queue.deinit();
+    try queue.start();
+    defer {
+        queue.stop();
+        queue.join();
+    }
+    if (queue.threads.len == 0) return error.SkipZigTest;
+    var completed = Atomic(u32).init(0);
+    const parent = queue.allocate(Noop{});
+    const child = queue.allocate(Noop{});
+    const continuation = queue.allocate(Done{ .completed = &completed });
+    queue.finishWith(child, parent);
+    queue.continueWith(parent, continuation);
+    try waitForTestValue(&queue.waiters, @intCast(queue.threads.len));
+    queue.schedule(parent);
+    queue.schedule(child);
+    try waitForTestValue(&completed, 1);
+    queue.wait(continuation);
+    try std.testing.expect(queue.isCompleted(parent));
+}
+
+test "shutdown wakes parked workers and handles a concurrent startup" {
+    const Queue = JobQueue(.{ .max_jobs_per_thread = 8, .max_threads = 2 });
+    for (0..32) |iteration| {
+        var queue = try Queue.init(std.testing.allocator, std.testing.io);
+        defer queue.deinit();
+        try queue.start();
+        defer {
+            queue.stop();
+            queue.join();
+        }
+        if (iteration % 2 == 0) try waitForTestValue(&queue.waiters, @intCast(queue.threads.len));
+    }
 }

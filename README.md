@@ -368,3 +368,14 @@ std.Thread.Pool:
 | **Total Result** | **2047** |
 
 See the code [here](src/benchmarks/basic_ordered/main.zig)
+
+## Worker parking
+
+Idle workers block until jobs or shutdown explicitly wake them; they do not
+periodically poll. The `idle_sleep_ns` configuration, `dynamic_sleep_ns` value,
+and `setSleepNs` method remain available for source compatibility, but no longer
+control worker parking.
+
+`wait` and `waitResult` help execute queued work, then block on the target job's
+completion when no work is available. `waitRealtime` keeps helping or spinning
+without parking its caller, for audio callbacks that must not sleep.
